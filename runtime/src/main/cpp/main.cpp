@@ -11,6 +11,8 @@
 #include <dirent.h>
 #include <stdint.h>
 
+static void maybe_install_uid_filter(const char *package_name);   // defined below
+
 void ZygoteLoaderModule::onLoad(zygisk::Api *_api, JNIEnv *_env) {
     api = _api;
     env = _env;
