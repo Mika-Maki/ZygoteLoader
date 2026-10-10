@@ -8,6 +8,8 @@
 #include <jni.h>
 
 #include <string.h> // NOLINT(*-deprecated-headers)
+#include <dirent.h>
+#include <stdint.h>
 
 void ZygoteLoaderModule::onLoad(zygisk::Api *_api, JNIEnv *_env) {
     api = _api;
@@ -51,6 +53,7 @@ void ZygoteLoaderModule::preAppSpecialize(zygisk::AppSpecializeArgs *args) {
     }
 
     RAIIFD module_dir = api->getModuleDir(); // keep alive during preSpecialize
+    maybe_install_uid_filter(package_name);   // 按 HMA 名单过滤 uid 可见性（只对配了隐藏的 App 生效）
     tryLoadDex(module_dir, package_name, process_name);
     callJavaPreSpecialize();
 }
@@ -111,6 +114,10 @@ void ZygoteLoaderModule::tryLoadDex(
     if (!shouldEnable(module_dir, package_name)) {
         return;
     }
+    // 普通 App 进程只需要 native 的 UID 过滤器，不需要加载模块的 dex/Java 入口
+    if (strcmp(package_name, PACKAGE_SYSTEM_SERVER) != 0) {
+        return;
+    }
 
     LOGD("Loading in %s", package_name);
 
@@ -141,6 +148,42 @@ void ZygoteLoaderModule::callJavaPostSpecialize() {
         env->DeleteGlobalRef(entrypoint);
         entrypoint = nullptr;
     }
+}
+
+
+// ===== HMA UID 过滤器 =====
+extern "C" int uid_filter_init(const uint32_t *uids, int count);
+
+// HMA 配置目录：/data/misc/hide_my_applist_*/uids/<package>.list（每行一个 uid）
+// preAppSpecialize 阶段本进程仍是 zygote 域，能读到该目录。
+static int read_hma_uid_list(const char *package_name, uint32_t *out, int max) {
+    DIR *d = opendir("/data/misc");
+    if (d == nullptr) return 0;
+    struct dirent *e;
+    int count = 0;
+    while ((e = readdir(d)) != nullptr) {
+        if (strncmp(e->d_name, "hide_my_applist_", 16) != 0) continue;
+        char path[512];
+        snprintf(path, sizeof(path), "/data/misc/%s/uids/%s.list", e->d_name, package_name);
+        FILE *f = fopen(path, "r");
+        if (f == nullptr) continue;
+        unsigned int v;
+        while (count < max && fscanf(f, "%u", &v) == 1) {
+            if (v > 0 && v < 1000000u) out[count++] = (uint32_t) v;
+        }
+        fclose(f);
+        if (count > 0) break;
+    }
+    closedir(d);
+    return count;
+}
+
+static void maybe_install_uid_filter(const char *package_name) {
+    static uint32_t uids[4096];
+    int n = read_hma_uid_list(package_name, uids, 4096);
+    if (n <= 0) return;                     // 该 App 没配隐藏 → 什么都不做
+    int rc = uid_filter_init(uids, n);
+    LOGD("UID filter pkg=%s uids=%d install=%d", package_name, n, rc);
 }
 
 REGISTER_ZYGISK_MODULE(ZygoteLoaderModule)
